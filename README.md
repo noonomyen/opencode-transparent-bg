@@ -4,6 +4,18 @@ Make OpenCode transparent with any theme, using your terminal's transparency
 through its default background. Text, selected rows, and dialog surfaces keep
 their theme colors. No OpenCode source changes are needed.
 
+## Installation
+
+Add the plugin to your existing `plugins` array in `opencode.jsonc`:
+
+```jsonc
+{
+  "plugins": ["github:noonomyen/opencode-transparent-bg"]
+}
+```
+
+## How it works
+
 ```mermaid
 flowchart TD
   A[Active theme colors] --> B[Plugin hooks each draw]

@@ -194,6 +194,22 @@ export default {
               !node.border &&
               (!node.shouldFill || node.backgroundColor.a === 0)
             previous(buffer, deltaTime)
+            const padding = active && node.live ? statusPadding(node) : undefined
+            if (
+              padding &&
+              buffer.getCurrentOpacity() > 0 &&
+              !preserved(node, preserveIds, transparentOverlays, true) &&
+              !preserved(padding, preserveIds, transparentOverlays)
+            ) {
+              // The pulse paints mixed RGB into status padding. Those colors are
+              // not theme surfaces; clear only its blank cells before icon draws.
+              buffer.pushScissorRect(node.screenX, node.screenY, node.width, node.height)
+              try {
+                stripBackground(buffer, padding, undefined, undefined, scissors.at(-1))
+              } finally {
+                buffer.popScissorRect()
+              }
+            }
             if (!active || empty || preserved(node, preserveIds, transparentOverlays)) return
             const diff = diffAncestor(node)
             const opacity = buffer.getCurrentOpacity()
@@ -288,6 +304,25 @@ function coversScreen(node: Renderable, renderer: CliRenderer) {
 function diffAncestor(node: Renderable): DiffRenderable | undefined {
   if (node instanceof DiffRenderable) return node
   return node.parent ? diffAncestor(node.parent) : undefined
+}
+
+function statusPadding(node: Renderable): BoxRenderable | undefined {
+  // Match pulse and title properties instead of bundled class names.
+  // Only the body pulse has a sibling row containing the status and title.
+  if (
+    !("outerPromptPulse" in node) ||
+    !("outerCompletionColor" in node) ||
+    typeof Reflect.get(node, "emitLevel") !== "function"
+  )
+    return undefined
+  for (const sibling of node.parent?.getChildren() ?? []) {
+    if (!(sibling instanceof BoxRenderable) || !sibling.visible) continue
+    const children = sibling.getChildren()
+    const title = children.findIndex((child) => "rename" in child && "backdrop" in child)
+    const padding = children[title - 1]
+    if (padding instanceof BoxRenderable && padding.visible) return padding
+  }
+  return undefined
 }
 
 function protectChangedLines(
@@ -407,7 +442,7 @@ function withClipping(
 function stripBackground(
   buffer: OptimizedBuffer,
   node: Renderable,
-  surfaces: Set<number>,
+  surfaces: Set<number> | undefined,
   highlights: Map<number, [number, number][]> | undefined,
   clip?: Parameters<OptimizedBuffer["pushScissorRect"]>,
 ) {
@@ -433,7 +468,11 @@ function stripBackground(
       const offset = cell * 4
       if (
         (data.bg[offset + 3] & 255) !== 0 &&
-        surfaces.has(((data.bg[offset] & 255) << 16) | ((data.bg[offset + 1] & 255) << 8) | (data.bg[offset + 2] & 255))
+        (surfaces
+          ? surfaces.has(
+              ((data.bg[offset] & 255) << 16) | ((data.bg[offset + 1] & 255) << 8) | (data.bg[offset + 2] & 255),
+            )
+          : data.char[cell] === 32)
       ) {
         data.bg.fill(0, offset, offset + 4)
       }
@@ -444,7 +483,9 @@ function stripBackground(
           (row === y || row === y + height - 1) &&
           data.char[cell] === node.customBorderChars?.horizontal?.codePointAt(0)) ||
           (vertical && (column === x || column === x + width - 1) && data.char[cell] === "╹".codePointAt(0))) &&
-        surfaces.has(((data.fg[offset] & 255) << 16) | ((data.fg[offset + 1] & 255) << 8) | (data.fg[offset + 2] & 255))
+        surfaces?.has(
+          ((data.fg[offset] & 255) << 16) | ((data.fg[offset + 1] & 255) << 8) | (data.fg[offset + 2] & 255),
+        )
       ) {
         data.char[cell] = 32
       }

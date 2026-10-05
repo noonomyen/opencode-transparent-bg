@@ -1,5 +1,7 @@
 import {
   BoxRenderable,
+  CodeRenderable,
+  LineNumberRenderable,
   DiffRenderable,
   OptimizedBuffer,
   RGBA,
@@ -24,7 +26,8 @@ export default {
       ? api.options.preserveIds.filter((id): id is string => typeof id === "string")
       : []
     const hooks = new Map<Renderable, { current: Renderable["render"]; descriptor?: PropertyDescriptor }>()
-    const completions = new Set<Renderable>()
+    const transparentOverlays = new Set<Renderable>()
+    const diffViews = new Set<Renderable>()
     const backgroundDescriptor = Object.getOwnPropertyDescriptor(renderer, "setBackgroundColor")
     const renderDescriptor = Object.getOwnPropertyDescriptor(root, "render")
     const setBackground = renderer.setBackgroundColor.bind(renderer)
@@ -33,8 +36,9 @@ export default {
     let background: Parameters<CliRenderer["setBackgroundColor"]>[0] =
       initialBackground instanceof RGBA ? initialBackground : api.theme.background.base
     let active = true
-    const palettes = new Map<number, Set<number>>()
+    const palettes = new Map<DiffRenderable | undefined, Map<number, Set<number>>>()
     const scissors: Parameters<OptimizedBuffer["pushScissorRect"]>[] = []
+    const highlights = new Map<DiffRenderable, Map<number, [number, number][]>>()
 
     const data = renderer.nextRenderBuffer.buffers
     if (
@@ -76,8 +80,9 @@ export default {
       setBackground(active ? transparent : color)
     }
 
-    function surfaceColors(opacity: number) {
-      const cached = palettes.get(opacity)
+    function surfaceColors(opacity: number, diff?: DiffRenderable) {
+      const palette = palettes.get(diff) ?? new Map<number, Set<number>>()
+      const cached = palette.get(opacity)
       if (cached) return cached
       const theme = api.theme
       const accents = new Set(
@@ -89,8 +94,9 @@ export default {
           theme.background.action.destructive.focused,
           theme.background.action.destructive.selected,
           ...Object.values(theme.text.feedback).map((color) => color.base),
+          diff?.selectionBg,
         ]
-          .filter((color) => color.a > 0)
+          .filter((color): color is RGBA => color instanceof RGBA && color.a > 0)
           .flatMap((color) => colorKeys(color, opacity)),
       )
       const surfaces = new Set(
@@ -99,21 +105,47 @@ export default {
           ...Object.values(theme.background.raised),
           ...Object.values(theme.background.formfield).filter((color): color is RGBA => color instanceof RGBA),
         ]
+          .filter((color): color is RGBA => color instanceof RGBA)
           .flatMap((color) => colorKeys(color, opacity))
           .filter((color) => !accents.has(color)),
       )
-      palettes.set(opacity, surfaces)
+      // A theme may reuse added/removed colors for context (for example Nord).
+      // Row metadata protects changed lines independently of their RGB values.
+      if (diff) {
+        const selection = new Set(diff.selectionBg ? colorKeys(diff.selectionBg, opacity) : [])
+        for (const color of [diff.contextBg, diff.contextContentBg, diff.lineNumberBg]) {
+          if (!(color instanceof RGBA)) continue
+          for (const key of colorKeys(color, opacity)) {
+            if (!selection.has(key)) surfaces.add(key)
+          }
+        }
+      }
+      palette.set(opacity, surfaces)
+      palettes.set(diff, palette)
       return surfaces
     }
 
     function renderRoot(buffer: OptimizedBuffer, deltaTime: number) {
       if (!active) return render(buffer, deltaTime)
       palettes.clear()
+      highlights.clear()
       const seen = new Set<Renderable>()
       const autocomplete = api.keymap?.mode.current() === "autocomplete"
-      completions.clear()
+      transparentOverlays.clear()
+      diffViews.clear()
       function visit(node: BaseRenderable) {
         if (node instanceof Renderable) seen.add(node)
+        if (node instanceof DiffRenderable) {
+          for (let parent = node.parent; parent; parent = parent.parent) {
+            if (
+              parent instanceof BoxRenderable &&
+              Reflect.get(parent, "_positionType") === "absolute" &&
+              parent.zIndex >= 2500
+            ) {
+              diffViews.add(parent)
+            }
+          }
+        }
         // Completion boxes have generated IDs. Match the active input mode and
         // its absolute list layer instead of tying transparency to those IDs.
         if (
@@ -123,7 +155,7 @@ export default {
           node.zIndex === 100 &&
           node.getChildren().some((child) => child instanceof ScrollBoxRenderable)
         ) {
-          completions.add(node)
+          transparentOverlays.add(node)
         }
         // Inline TextNodeRenderable children are drawn by their text parent.
         if (node instanceof Renderable && !hooks.has(node)) {
@@ -133,7 +165,12 @@ export default {
           // Native text and editor renderables have their own render paths.
           // Wrap the instance's complete draw so native text backgrounds are covered too.
           const current: Renderable["render"] = (buffer, deltaTime) => {
-            if (active && isBackdrop(node, renderer) && !preserved(node, preserveIds, completions, true)) {
+            // Fullscreen diff viewers are pages; a dialog's dimming backdrop is
+            // still an overlay even when its popup happens to contain a diff.
+            if (active && diffViews.has(node) && coversScreen(node, renderer) && !isBackdrop(node, renderer)) {
+              transparentOverlays.add(node)
+            }
+            if (active && isBackdrop(node, renderer) && !preserved(node, preserveIds, transparentOverlays, true)) {
               const fill = node.shouldFill
               // Skip dimming before alpha blending changes the underlying text.
               // Keep render() running so the backdrop still receives outside clicks.
@@ -157,10 +194,17 @@ export default {
               !node.border &&
               (!node.shouldFill || node.backgroundColor.a === 0)
             previous(buffer, deltaTime)
-            if (!active || empty || preserved(node, preserveIds, completions)) return
+            if (!active || empty || preserved(node, preserveIds, transparentOverlays)) return
+            const diff = diffAncestor(node)
             const opacity = buffer.getCurrentOpacity()
             if (opacity === 0) return
-            stripBackground(buffer, node, surfaceColors(opacity), scissors.at(-1))
+            let rows = diff ? highlights.get(diff) : undefined
+            if (diff && !rows) {
+              rows = new Map()
+              protectChangedLines(diff, rows, buffer, scissors.at(-1))
+              highlights.set(diff, rows)
+            }
+            stripBackground(buffer, node, surfaceColors(opacity, diff), rows, scissors.at(-1))
           }
           node.render = current
           hooks.set(node, { current, descriptor })
@@ -189,7 +233,9 @@ export default {
         }
       })
       hooks.clear()
-      completions.clear()
+      transparentOverlays.clear()
+      diffViews.clear()
+      highlights.clear()
       palettes.clear()
       sample.destroy()
       if (root.render === renderRoot) {
@@ -230,14 +276,58 @@ function colorKey(color: RGBA) {
   return ((color.buffer[0] & 255) << 16) | ((color.buffer[1] & 255) << 8) | (color.buffer[2] & 255)
 }
 
+function coversScreen(node: Renderable, renderer: CliRenderer) {
+  return (
+    node.screenX <= 0 &&
+    node.screenY <= 0 &&
+    node.screenX + node.width >= renderer.width &&
+    node.screenY + node.height >= renderer.height
+  )
+}
+
+function diffAncestor(node: Renderable): DiffRenderable | undefined {
+  if (node instanceof DiffRenderable) return node
+  return node.parent ? diffAncestor(node.parent) : undefined
+}
+
+function protectChangedLines(
+  diff: DiffRenderable,
+  highlights: Map<number, [number, number][]>,
+  buffer: OptimizedBuffer,
+  clip?: Parameters<OptimizedBuffer["pushScissorRect"]>,
+) {
+  for (const side of diff.getChildren()) {
+    if (!(side instanceof LineNumberRenderable) || !side.visible) continue
+    const code = side.getChildren().find((child): child is CodeRenderable => child instanceof CodeRenderable)
+    if (!code) continue
+    const y = Math.trunc(side.screenY)
+    const top = Math.max(0, y, clip?.[1] ?? 0)
+    const bottom = Math.min(buffer.height, y + Math.trunc(side.height), clip ? clip[1] + clip[3] : buffer.height)
+    const left = Math.max(0, Math.trunc(side.screenX), clip?.[0] ?? 0)
+    const right = Math.min(
+      buffer.width,
+      Math.trunc(side.screenX) + Math.trunc(side.width),
+      clip ? clip[0] + clip[2] : buffer.width,
+    )
+    if (bottom <= top || right <= left) continue
+    const sources = code.getLineSources(Math.trunc(code.scrollY) + top - y, bottom - top)
+    const signs = side.getLineSigns()
+    sources.forEach((source, index) => {
+      const sign = signs.get(source)?.after?.trim()
+      if (sign !== "+" && sign !== "-") return
+      const row = top + index
+      const ranges = highlights.get(row) ?? []
+      ranges.push([left, right])
+      highlights.set(row, ranges)
+    })
+  }
+}
+
 function isBackdrop(node: Renderable, renderer: CliRenderer): node is BoxRenderable {
   return (
     node instanceof BoxRenderable &&
     Reflect.get(node, "_positionType") === "absolute" &&
-    node.screenX <= 0 &&
-    node.screenY <= 0 &&
-    node.screenX + node.width >= renderer.width &&
-    node.screenY + node.height >= renderer.height &&
+    coversScreen(node, renderer) &&
     node.backgroundColor.r === 0 &&
     node.backgroundColor.g === 0 &&
     node.backgroundColor.b === 0 &&
@@ -246,14 +336,17 @@ function isBackdrop(node: Renderable, renderer: CliRenderer): node is BoxRendera
   )
 }
 
-function preserved(node: Renderable, ids: string[], completions: Set<Renderable>, explicit = false): boolean {
+function preserved(node: Renderable, ids: string[], transparentOverlays: Set<Renderable>, explicit = false): boolean {
   if (ids.includes(node.id)) return true
-  if (!explicit && node instanceof DiffRenderable) return true
   // OpenTUI exposes position as a setter only. Its stored value distinguishes
   // overlays from ordinary docked UI, including the sidebar.
-  if (!explicit && !completions.has(node) && (Reflect.get(node, "_positionType") === "absolute" || node.zIndex >= 2500))
+  if (
+    !explicit &&
+    !transparentOverlays.has(node) &&
+    (Reflect.get(node, "_positionType") === "absolute" || node.zIndex >= 2500)
+  )
     return true
-  return node.parent ? preserved(node.parent, ids, completions, explicit) : false
+  return node.parent ? preserved(node.parent, ids, transparentOverlays, explicit) : false
 }
 
 function withClipping(
@@ -315,6 +408,7 @@ function stripBackground(
   buffer: OptimizedBuffer,
   node: Renderable,
   surfaces: Set<number>,
+  highlights: Map<number, [number, number][]> | undefined,
   clip?: Parameters<OptimizedBuffer["pushScissorRect"]>,
 ) {
   const data = buffer.buffers
@@ -332,7 +426,9 @@ function stripBackground(
   const vertical = node instanceof BoxRenderable && node.customBorderChars?.vertical === "╹"
 
   for (let row = top; row < bottom; row++) {
+    const protectedRanges = highlights?.get(row)
     for (let column = left; column < right; column++) {
+      if (protectedRanges?.some(([start, end]) => column >= start && column < end)) continue
       const cell = row * buffer.width + column
       const offset = cell * 4
       if (
